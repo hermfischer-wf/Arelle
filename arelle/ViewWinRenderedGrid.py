@@ -47,7 +47,7 @@ integerItemTypes = {"integerItemType", "nonPositiveIntegerItemType", "negativeIn
                     "longItemType", "intItemType", "shortItemType", "byteItemType",
                     "nonNegativeIntegerItemType", "unsignedLongItemType", "unsignedIntItemType",
                     "unsignedShortItemType", "unsignedByteItemType", "positiveIntegerItemType"}
-TABLE_AXIS_ROLES = (XbrlConst.tableBreakdown, XbrlConst.tableBreakdownMMDD)
+TABLE_AXIS_ROLES = (XbrlConst.euTableAxis, XbrlConst.tableBreakdown, XbrlConst.tableBreakdownMMDD)
 
 '''
 Returns a tuple with all known table axis roles
@@ -126,6 +126,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
         self.ignoreDimValidity = BooleanVar(value=self.options.setdefault("ignoreDimValidity",True))
         formulaEvaluatorInit() # one-time module initialization
         self.conceptMessageIssued = False
+        self.tblMenuEntries = {}
 
     def close(self):
         super(ViewRenderedGrid, self).close()
@@ -138,22 +139,21 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
             self.rendrCntx = None # remove the reference but do not manipulate since it may still be in use and shared
 
     def loadTablesMenu(self):
-        tblMenuEntries = {}
-        self.tablesToELR = {}
-        for lytMdlTableSet in self.lytMdlTblMdl.lytMdlTableSets:
-            # table name
-            modelRoleTypes = self.modelXbrl.roleTypes.get(lytMdlTableSet.srcLinkrole)
-            if modelRoleTypes is not None and len(modelRoleTypes) > 0:
-                # roledefinition = modelRoleTypes[0].definition
-                roledefinition = self.modelXbrl.roleTypeDefinition(lytMdlTableSet.srcLinkrole, self.lang) # Definition in selected language
-                if roledefinition is None or roledefinition == "":
-                    roledefinition = os.path.basename(tblLinkroleUri)
-                # add table to menu if there's any entry
-                tblMenuEntries[roledefinition] = lytMdlTableSet.srcLinkrole
+        if not self.tblMenuEntries:
+            for lytMdlTableSet in self.lytMdlTblMdl.lytMdlTableSets:
+                # table name
+                modelRoleTypes = self.modelXbrl.roleTypes.get(lytMdlTableSet.srcLinkrole)
+                if modelRoleTypes is not None and len(modelRoleTypes) > 0:
+                    # roledefinition = modelRoleTypes[0].definition
+                    roledefinition = self.modelXbrl.roleTypeDefinition(lytMdlTableSet.srcLinkrole, self.lang) # Definition in selected language
+                    if roledefinition is None or roledefinition == "":
+                        roledefinition = os.path.basename(lytMdlTableSet.srcLinkrole)
+                    # add table to menu if there's any entry
+                    self.tblMenuEntries[roledefinition] = lytMdlTableSet.srcLinkrole
         self.tablesMenu.delete(0, self.tablesMenuLength)
         self.tablesMenuLength = 0
         self.tblELR = None
-        for tblMenuEntry in sorted(tblMenuEntries.items()):
+        for tblMenuEntry in sorted(self.tblMenuEntries.items()):
             tbl,elr = tblMenuEntry
             self.tablesMenu.add_command(label=tbl, command=lambda e=elr: self.view(viewTblELR=e)) # use this to activate profiling from menu selection:  , profile=True))
             self.tablesMenuLength += 1
@@ -251,7 +251,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                     self.numXHdrRows += lytMdlXHdr.maxNumLabels
 
         dataFirstRow = self.colHdrTopRow + self.numXHdrRows
-        if TRACE_TK: print(f"resizeTable rows {self.dataFirstRow+self.dataRows} cols {self.dataFirstCol+self.dataCols} titleRows {self.dataFirstRow} titleColumns {self.dataFirstCol})")
+        if TRACE_TK: print(f"resizeTable rows {self.dataFirstRow+self.dataRows} cols {self.numYHdrCols+self.dataCols} titleRows {self.dataFirstRow} titleColumns {self.numYHdrCols})")
         self.table.resizeTable(dataFirstRow+self.dataRows, self.numYHdrCols+self.dataCols, titleRows=dataFirstRow, titleColumns=self.numYHdrCols)
 
         try:
@@ -279,7 +279,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
             self.aspectEntryObjectIdsNode.clear()
             self.aspectEntryObjectIdsCell.clear()
             self.factPrototypeAspectEntryObjectIds.clear()
-            if TRACE_TK: print(f"tbl hdr x {0} y {0} cols {self.dataFirstCol} rows {self.dataFirstRow} value {(self.defnMdlTable.genLabel(lang=self.lang, strip=True) or self.roledefinition)}")
+            if TRACE_TK: print(f"tbl hdr x {0} y {0} cols {self.numYHdrCols-1} rows {dataFirstRow - 1} value {lytMdlTableSet.label}")
             self.table.initHeaderCellValue(lytMdlTableSet.label,
                                            0, 0, self.numYHdrCols-1, dataFirstRow - 1,
                                            XbrlTable.TG_TOP_LEFT_JUSTIFIED)
@@ -316,7 +316,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
         # create combo box cells for multiple choice elements
         for iZ, (aspect, aspectChoices) in enumerate(self.zAspectChoices.items()):
             values = [a for a in aspectChoices.keys()]
-            if TRACE_TK: print(f"zAxis comboBox x {xValue + 1} y {yValue} values {valueHeaders} value {comboBoxValue}")
+            if TRACE_TK: print(f"zAxis comboBox x {self.dataFirstCol} y {iZ} values {values} value {self.zHdrElts[self.zTbl][aspect]} colspan {colSpan}")
             combobox = self.table.initHeaderCombobox(self.dataFirstCol,
                                                      iZ,
                                                      values=values,
@@ -455,7 +455,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                         for aspect, aspectValue in cellAspectValues.items():
                             if isinstance(aspectValue, str) and aspectValue.startswith(OPEN_ASPECT_ENTRY_SURROGATE):
                                 self.factPrototypeAspectEntryObjectIds[objectId].add(aspectValue)
-                    if fp is not None and not fp.concept.isAbstract:
+                    if fp is not None and fp.concept is not None and not fp.concept.isAbstract:
                         modelConcept = fp.concept
                         if (justify is None) and modelConcept is not None:
                             justify = XbrlTable.TG_RIGHT_JUSTIFIED if modelConcept.isNumeric else XbrlTable.TG_LEFT_JUSTIFIED
@@ -476,7 +476,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                             except ValueError:
                                 effectiveValue = enumerationValues[0]
                                 selectedIdx = 0
-                            if TRACE_TK: print(f"body comboBox enums x {xValue} y {yValue} values {effectiveValue} value {enumerationValues}")
+                            if TRACE_TK: print(f"body comboBox enums x {xColNum} y {yRowNum} values {enumerationValues} value {effectiveValue}")
                             self.table.initCellCombobox(effectiveValue,
                                                         enumerationValues,
                                                         xColNum,
@@ -485,15 +485,15 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                                                         selectindex=selectedIdx,
                                                         codes=enumerationDict)
                         elif modelConcept is not None and modelConcept.type.qname == XbrlConst.qnXbrliQNameItemType:
-                            if eurofilingModelPrefix in concept.nsmap and concept.nsmap.get(eurofilingModelPrefix) == eurofilingModelNamespace:
-                                hierarchy = concept.get("{" + eurofilingModelNamespace + "}" + "hierarchy", None)
-                                domainQNameAsString = concept.get("{" + eurofilingModelNamespace + "}" + "domain", None)
+                            if eurofilingModelPrefix in modelConcept.nsmap and modelConcept.nsmap.get(eurofilingModelPrefix) == eurofilingModelNamespace:
+                                hierarchy = modelConcept.get("{" + eurofilingModelNamespace + "}" + "hierarchy", None)
+                                domainQNameAsString = modelConcept.get("{" + eurofilingModelNamespace + "}" + "domain", None)
                                 if hierarchy is not None and domainQNameAsString is not None:
                                     newAspectValues = [""]
                                     newAspectQNames = dict()
                                     newAspectQNames[""] = None
                                     domPrefix, _, domLocalName = domainQNameAsString.strip().rpartition(":")
-                                    domNamespace = concept.nsmap.get(domPrefix)
+                                    domNamespace = modelConcept.nsmap.get(domPrefix)
                                     relationships = concept_relationships(self.rendrCntx,
                                          None,
                                          (QName(domPrefix, domNamespace, domLocalName),
@@ -529,7 +529,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                                 except ValueError:
                                     effectiveValue = qNameValues[0]
                                     selectedIdx = 0
-                                if TRACE_TK: print(f"body comboBox qnames x {xValue} y {yValue} values {effectiveValue} value {qNameValues}")
+                                if TRACE_TK: print(f"body comboBox qnames x {xColNum} y {yRowNum} values {qNameValues} value {effectiveValue}")
                                 self.table.initCellCombobox(effectiveValue,
                                                             qNameValues,
                                                             xColNum,
@@ -547,7 +547,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                             except ValueError:
                                 effectiveValue = booleanValues[0]
                                 selectedIdx = 0
-                            if TRACE_TK: print(f"body comboBox bools x {xValue} y {yValue} values {effectiveValue} value {booleanValues}")
+                            if TRACE_TK: print(f"body comboBox bools x {xColNum} y {yRowNum} values {booleanValues} value {effectiveValue}")
                             self.table.initCellCombobox(effectiveValue,
                                                         booleanValues,
                                                         xColNum,
@@ -555,7 +555,7 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
                                                         objectId=objectId,
                                                         selectindex=selectedIdx)
                         else:
-                            if TRACE_TK: print(f"body cell x {leftCol + i} y {yRowNum} value {value}")
+                            if TRACE_TK: print(f"body cell x {xColNum} y {yRowNum} value {value}")
                             self.table.initCellValue(value,
                                                      xColNum,
                                                      yRowNum,
@@ -600,10 +600,12 @@ class ViewRenderedGrid(ViewWinTkTable.ViewTkTable):
             try:
                 if isinstance(modelObject, ModelDtsObject.ModelRelationship):
                     objectId = modelObject.toModelObject.objectId()
+                elif isinstance(modelObject, ModelDtsObject.ModelRoleType):
+                    objectId = self.modelXbrl.roleTypeDefinition(modelObject.roleURI, self.lang)
                 else:
                     objectId = modelObject.objectId()
-                if objectId in self.tablesToELR:
-                    self.view(viewTblELR=self.tablesToELR[objectId])
+                if objectId in self.tblMenuEntries:
+                    self.view(viewTblELR=self.tblMenuEntries[objectId])
                     try:
                         self.modelXbrl.modelManager.cntlr.currentView = self.modelXbrl.guiViews.tableView
                         # force focus (synch) on the corresponding "Table" tab (useful in case of several instances)
