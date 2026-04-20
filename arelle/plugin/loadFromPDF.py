@@ -116,7 +116,7 @@ Use arelle/examples/viewer/inlinePdfViewer.html with
 from pikepdf import Pdf, Dictionary, Array, Stream, Operator, parse_content_stream, unparse_content_stream, _core, AttachedFileSpec
 from collections import defaultdict, OrderedDict
 from decimal import Decimal
-import sys, os, json, regex as re
+import sys, os, io, json, regex as re
 
 DEFAULT_TEMPLATE_FILE_NAME = "xbrl-report-template.json"
 DEFAULT_REPORT_FILE_NAME =  "xbrl-report.json"
@@ -243,24 +243,15 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                 else:
                     return numToBytes(bytesToNum(op) + diff).decode("UTF-16BE")
 
-    # load marked content (structured paragraph and section strings
-    for pIndex, page in enumerate(pdf.pages):
-        p = page.objgen[0] # for matching to pdf.js page number
-        fonts = {}
-        fontRanges = {} # [start, end, toStart or [to values list]
-        for name, font in page.get("/Resources",{}).get("/Font", {}).items():
+    def addFontsFromResources(fonts, resources):
+        for name, font in resources.get("/Font", {}).items():
             if not isPortableCollection and "/ToUnicode" in font:
                 fm = {}
                 fr = []
                 cr = []
                 fonts[name] = {"bfchars": fm, "bfranges": fr, "csranges": cr}
-                codespacerange = []
-                beginCount = 0
-                fbcharNum = 0
                 for i in parse_content_stream(font["/ToUnicode"]):
-                    if i.operator in (Operator("begincodespacerange"), Operator("beginbfrange"), Operator("beginbfchar")):
-                        beginCount = i.operands[0]
-                    elif i.operator == Operator("endcodespacerange"):
+                    if i.operator == Operator("endcodespacerange"):
                         cr.append([c.__bytes__() for c in i.operands])
                     elif i.operator == Operator("endbfrange"):
                         for l in range(0, len(i.operands),3):
@@ -272,7 +263,6 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                             else:
                                 fr.append( [startChar, endChar, i.operands[l+2].__bytes__()] )
                     elif i.operator == Operator("endbfchar"):
-                        #print(f"{name} fontInstr opr {str(i.operator)} ornd {[o.__bytes__() for o in i.operands]}")
                         c = None
                         for l in i.operands:
                             if c is None:
@@ -283,6 +273,42 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
             elif "/Encoding" in font:
                 fonts[name] = {"encoding": str(font["/Encoding"])}
 
+    def traversalKey(obj):
+        try:
+            objgen = obj.objgen
+        except AttributeError:
+            return ("py", id(obj))
+        if objgen != (0, 0):
+            return ("pdf", objgen)
+        return ("py", id(obj))
+
+    def iterPageInstructions(contentObj, resources, visitedForms, fonts):
+        for i in parse_content_stream(contentObj, "BDC Tf Tj TJ EMC Td TD Tm T* Do"):
+            if i.operator == Operator("Do") and i.operands:
+                xObjectName = i.operands[0]
+                xObjects = resources.get("/XObject", {})
+                if xObjectName in xObjects:
+                    xobj = xObjects[xObjectName]
+                    if str(xobj.get("/Subtype")) == "/Form":
+                        xobjKey = traversalKey(xobj)
+                        if xobjKey in visitedForms:
+                            continue
+                        visitedForms.add(xobjKey)
+                        formResources = xobj.get("/Resources", resources)
+                        addFontsFromResources(fonts, formResources)
+                        for nested in iterPageInstructions(xobj, formResources, visitedForms, fonts):
+                            yield nested
+                        visitedForms.remove(xobjKey)
+            else:
+                yield i
+
+    # load marked content (structured paragraph and section strings
+    for pIndex, page in enumerate(pdf.pages):
+        p = page.objgen[0] # for matching to pdf.js page number
+        fonts = {}
+        pageResources = page.get("/Resources", {})
+        addFontsFromResources(fonts, pageResources)
+
         ##or name, font in fonts.items():
         #    print(f"font {name} bytes {font}")
         mcid = None
@@ -290,7 +316,7 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
         pos = None
         fontName = fontSize = None
         font = None
-        instructions = parse_content_stream(page, "BDC Tf Tj TJ EMC Td TD Tm T* ")
+        instructions = iterPageInstructions(page, pageResources, set(), fonts)
         for i in instructions:
             if i.operator == Operator("BDC"):
                 #if i.operands[0] == "/P" and "/MCID" in i.operands[1]:
@@ -364,14 +390,36 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
     textBlocks = {}
     structMcid = defaultdict(list)
 
-    def loadTextBlocks(obj, pdfId="", key="", indent="", page=None, depth=0, trail=[]):
+    def objectTraversalKey(obj):
+        try:
+            objgen = obj.objgen
+        except AttributeError:
+            return ("py", id(obj))
+        if objgen != (0, 0):
+            return ("pdf", objgen)
+        return ("py", id(obj))
+
+    def loadTextBlocks(obj, pdfId="", key="", indent="", page=None, depth=0, trail=None, visited=None):
+        if trail is None:
+            trail = []
+        if visited is None:
+            visited = set()
         if depth > 100:
             print(f"excessive recursion depth={depth} trail={trail}")
             return
         if isinstance(obj, (Array, list, tuple)):
+            objKey = objectTraversalKey(obj)
+            if objKey in visited:
+                return
+            visited.add(objKey)
             for v in obj:
-                loadTextBlocks(v, pdfId, key, indent + "  ", page, depth+1, trail+[key])
+                loadTextBlocks(v, pdfId, key, indent + "  ", page, depth+1, trail+[key], visited)
+            visited.remove(objKey)
         elif isinstance(obj, (Stream, Dictionary, dict)):
+            objKey = objectTraversalKey(obj)
+            if objKey in visited:
+                return
+            visited.add(objKey)
             if "/ID" in obj:
                 pdfId = str(obj["/ID"])
             elif missingIDprefix:
@@ -380,13 +428,26 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                 page = obj["/Pg"].objgen[0]
             for k, v in obj.items():
                 if k not in ("/IDTree", "/P", "/Parent", "/Pg", "/Ff", "/Mk", "/Q", "/Rect", "/Font", "/Type", "/ColorSpace", "/MediaBox", "/Resources", "/Matrix", "/BBox", "/Border", "/DA", "/Length"):
-                    loadTextBlocks(v, pdfId, k, indent + "  ", page, depth+1, trail+[k])
+                    loadTextBlocks(v, pdfId, k, indent + "  ", page, depth+1, trail+[k], visited)
+            visited.remove(objKey)
         elif key == "/K":
+            if page == 78:
+                print("trace")
             if pdfId:
-                if (page, obj) in markedContents:
-                    # markedContent, bbox = markedContents[page,obj]
-                    markedContent = markedContents[page,obj]
-                    mcid = f"p{page}R_mc{obj}"
+                if page is not None:
+                    markedContent = markedContents.get((page, obj))
+                    mcidPage = page
+                else:
+                    # Struct element lacks /Pg (common on first/default page); search all pages for this MCID
+                    mcidPage = None
+                    markedContent = None
+                    for (pg, mc), entry in markedContents.items():
+                        if mc == obj:
+                            mcidPage = pg
+                            markedContent = entry
+                            break
+                if markedContent is not None:
+                    mcid = f"p{mcidPage}R_mc{obj}"
                     if pdfId in textBlocks:
                         if mcid not in structMcid[pdfId]:
                             textBlocks[pdfId] += "\n" + markedContent["txt"]
@@ -404,7 +465,7 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
     def loadFormFields(obj, pdfId="", altId="", key="", indent=""):
         if isinstance(obj, (Array, list, tuple)):
             if key == "/Rect":
-                if pdfId or Tu:
+                if pdfId:
                     formFields[str(pdfId)]["Rect"] = [float(x) if isinstance(x, Decimal) else x for x in obj]
             else:
                 for v in obj:
@@ -538,7 +599,7 @@ def isPdfLoadable(modelXbrl, mappedUri, normalizedUri, filepath, **kwargs):
     elif isHttpUrl(normalizedUri) and '?' in _ext: # query parameters and not .pdf, may be PDF anyway
         with io.open(filepath, 'rt', encoding='utf-8') as f:
             _fileStart = f.read(256)
-        if _fileStart and re_match(r"%PDF-(1\.[67]|2.[0])", _fileStart):
+        if _fileStart and re.match(r"%PDF-(1\.[67]|2.[0])", _fileStart):
             lastFilePathIsPDF = True
     return lastFilePathIsPDF
 
