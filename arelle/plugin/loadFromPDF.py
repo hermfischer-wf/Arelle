@@ -303,8 +303,10 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                 yield i
 
     # load marked content (structured paragraph and section strings
+    pdfPageRefNums = {}
     for pIndex, page in enumerate(pdf.pages):
-        p = page.objgen[0] # for matching to pdf.js page number
+        p = pIndex + 1 # for matching to pdf.js one-based page numbering
+        pdfPageRefNums[page.objgen[0]] = p # for matching to pdf.js page.ref.num
         fonts = {}
         pageResources = page.get("/Resources", {})
         addFontsFromResources(fonts, pageResources)
@@ -425,7 +427,7 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
             elif missingIDprefix:
                 pdfId = f"{missingIDprefix}{len(textBlocks)}"
             if "/Pg" in obj:
-                page = obj["/Pg"].objgen[0]
+                page = pdfPageRefNums[obj["/Pg"].objgen[0]]
             for k, v in obj.items():
                 if k not in ("/IDTree", "/P", "/Parent", "/Pg", "/Ff", "/Mk", "/Q", "/Rect", "/Font", "/Type", "/ColorSpace", "/MediaBox", "/Resources", "/Matrix", "/BBox", "/Border", "/DA", "/Length"):
                     loadTextBlocks(v, pdfId, k, indent + "  ", page, depth+1, trail+[k], visited)
@@ -479,7 +481,7 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                 if k not in ("/IDTree", "/P", "/Parent", "/Pg", "/Ff", "/Mk", "/Q", "/Font", "/Type", "/ColorSpace", "/MediaBox", "/Resources", "/Matrix", "/BBox", "/Border", "/DA", "/Length"):
                     loadFormFields(v, pdfId, altId, k, indent + "  ")
             if "/P" in obj and str(obj["/P"].Type) == "/Page":
-                formFields[str(pdfId)]["Page"] = obj["/P"].objgen[0]
+                formFields[str(pdfId)]["Page"] = pdfPageRefNums[obj["/P"].objgen[0]]
                 if altId:
                     formFields[str(pdfId)]["AltId"] = str(altId)
         elif key == "/V":
