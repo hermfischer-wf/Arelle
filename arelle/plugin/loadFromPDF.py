@@ -113,7 +113,7 @@ Use arelle/examples/viewer/inlinePdfViewer.html with
 
 
 """
-from pikepdf import Pdf, Dictionary, Array, Stream, Operator, parse_content_stream, unparse_content_stream, _core, AttachedFileSpec
+from pikepdf import Pdf, Dictionary, Array, Stream, Operator, parse_content_stream, unparse_content_stream, _core, AttachedFileSpec, Name, Dictionary
 from collections import defaultdict, OrderedDict
 from decimal import Decimal
 import sys, os, io, json, regex as re
@@ -225,12 +225,35 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
     markedContents = {}
     ixTextFields = defaultdict(list)
     ixFormFields = []
+    debugStats = {
+        "droppedNoneGlyphs": 0,
+        "emptyMappedGlyphs": 0,
+        "normalizedNbspChars": 0,
+        "textOpsWithoutMcid": 0,
+    }
+
+    def normalizeExtractedText(s):
+        if s is None:
+            return None
+        if "\xa0" in s:
+            debugStats["normalizedNbspChars"] += s.count("\xa0")
+            return s.replace("\xa0", " ")
+        return s
 
     def fontChar(font, c):
         if isPortableCollection:
             return chr(c)
         if "encoding" in font:
-            return encoding[font["encoding"]][c] # c is a byte, not char
+            fontEncoding = font["encoding"]
+            if isinstance(fontEncoding, Name):
+                if c in encoding[fontEncoding]:
+                    return encoding[fontEncoding][c] # c is a byte, not char
+                else:
+                    return "" # not sure how to handle other types of encoding dictionary
+            elif isinstance(fontEncoding, Dictionary):
+                if "/BaseEncoding" in fontEncoding and c in encoding[fontEncoding["/BaseEncoding"]]:
+                    return encoding[fontEncoding["/BaseEncoding"]][c] # c is a byte, not char 
+                return "" # not sure how to handle other types of encoding dictionary
         if c in font["bfchars"]:
             return font["bfchars"][c]
         for start, end, op in font["bfranges"]:
@@ -242,6 +265,7 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                     return "?"
                 else:
                     return numToBytes(bytesToNum(op) + diff).decode("UTF-16BE")
+        return ""
 
     def addFontsFromResources(fonts, resources):
         for name, font in resources.get("/Font", {}).items():
@@ -271,7 +295,7 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                                 fm[c] = l.__bytes__().decode("UTF-16BE")
                                 c = None
             elif "/Encoding" in font:
-                fonts[name] = {"encoding": str(font["/Encoding"])}
+                fonts[name] = {"encoding": font["/Encoding"]}
 
     def traversalKey(obj):
         try:
@@ -300,7 +324,26 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                             yield nested
                         visitedForms.remove(xobjKey)
             else:
-                yield i
+                yield i, resources
+
+    def resolveMarkedContentMcid(operands, resources):
+        """Resolve MCID from BDC operands.
+
+        BDC may provide either:
+        - an inline property dictionary containing /MCID, or
+        - a property-list name (e.g. /MC0) that resolves via Resources/Properties.
+        """
+        if len(operands) < 2:
+            return None
+        propsOperand = operands[1]
+        if isinstance(propsOperand, Dictionary):
+            return propsOperand.get("/MCID")
+        if isinstance(propsOperand, Name):
+            propsDict = resources.get("/Properties", {})
+            propsObj = propsDict.get(propsOperand)
+            if isinstance(propsObj, Dictionary):
+                return propsObj.get("/MCID")
+        return None
 
     # load marked content (structured paragraph and section strings
     pdfPageRefNums = {}
@@ -313,45 +356,57 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
 
         ##or name, font in fonts.items():
         #    print(f"font {name} bytes {font}")
-        mcid = None
-        txt = []
-        pos = None
+        markedContentStack = []
         fontName = fontSize = None
         font = None
         instructions = iterPageInstructions(page, pageResources, set(), fonts)
-        for i in instructions:
+
+        def activeMarkedContentFrame():
+            for frame in reversed(markedContentStack):
+                if frame["mcid"] is not None:
+                    return frame
+            return None
+
+        for i, instrResources in instructions:
             if i.operator == Operator("BDC"):
-                #if i.operands[0] == "/P" and "/MCID" in i.operands[1]:
-                if "/MCID" in i.operands[1]:
-                    mcid = i.operands[1]["/MCID"] # start of marked content
+                # BDC properties can be inline dictionaries or named property-list
+                # entries (e.g. /MC0) under Resources/Properties.
+                mcidResolved = resolveMarkedContentMcid(i.operands, instrResources)
+                markedContentStack.append({"mcid": mcidResolved, "txt": [], "pos": None})
             elif i.operator == Operator("Td"): #Move to the start of the next line
-                if txt and i.operands[1] < 0:
-                    txt.append("\n")
+                frame = activeMarkedContentFrame()
+                if frame is not None and frame["txt"] and i.operands[1] < 0:
+                    frame["txt"].append("\n")
             elif i.operator == Operator("TD"): #move to next line
-                if txt and i.operands[1] < 0:
-                    txt.append("\n")
+                frame = activeMarkedContentFrame()
+                if frame is not None and frame["txt"] and i.operands[1] < 0:
+                    frame["txt"].append("\n")
             elif i.operator == Operator("Tm"): #Set the text matrix, Tm
-                m = list(i.operands)
-                if pos is None:
-                    pos = m
-                else:
-                    pos[0] = min(m[0], pos[0])
-                    pos[1] = max(m[1], pos[1])
-                    pos[2] = min(m[2], pos[2])
-                    pos[3] = min(m[3], pos[3])
-                    pos[4] = max(m[4], pos[4])
-                    pos[5] = min(m[5], pos[5])
+                frame = activeMarkedContentFrame()
+                if frame is not None:
+                    m = list(i.operands)
+                    pos = frame["pos"]
+                    if pos is None:
+                        frame["pos"] = m
+                    else:
+                        pos[0] = min(m[0], pos[0])
+                        pos[1] = max(m[1], pos[1])
+                        pos[2] = min(m[2], pos[2])
+                        pos[3] = min(m[3], pos[3])
+                        pos[4] = max(m[4], pos[4])
+                        pos[5] = min(m[5], pos[5])
             elif i.operator == Operator("T*"):
-                if txt:
-                    txt.append("\n")
-            elif i.operator == Operator("EMC") and mcid is not None:
-                #print(f"pg {p} mcid {mcid} font {fontName} tj {''.join(txt)}")
-                markedContents[p,mcid] = {
-                    "txt": ''.join(txt), # [''.join(txt), bbox]
-                    "pos": pos}
-                mcid = None # end of this marked content
-                pos = None
-                txt = []
+                frame = activeMarkedContentFrame()
+                if frame is not None and frame["txt"]:
+                    frame["txt"].append("\n")
+            elif i.operator == Operator("EMC"):
+                if markedContentStack:
+                    frame = markedContentStack.pop()
+                    if frame["mcid"] is not None:
+                        #print(f"pg {p} mcid {frame['mcid']} font {fontName} tj {''.join(frame['txt'])}")
+                        markedContents[p,frame["mcid"]] = {
+                            "txt": ''.join(frame["txt"]), # [''.join(txt), bbox]
+                            "pos": frame["pos"]}
             elif i.operator == Operator("Tf"):
                 fontName = str(i.operands[0])
                 fontSize = i.operands[1]
@@ -360,33 +415,69 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                 else:
                     font = None
             elif i.operator == Operator("Tj"):
+                frame = activeMarkedContentFrame()
+                if frame is None:
+                    debugStats["textOpsWithoutMcid"] += 1
+                    continue
                 for s in i.operands:
                     t = s.__bytes__()
                     if font:
                         if "encoding" in font:
                             for b in t:
-                                txt.append(fontChar(font, b))
+                                ch = fontChar(font, b)
+                                if ch is None:
+                                    debugStats["droppedNoneGlyphs"] += 1
+                                else:
+                                    ch = normalizeExtractedText(ch)
+                                    if ch == "":
+                                        debugStats["emptyMappedGlyphs"] += 1
+                                    frame["txt"].append(ch)
                         else:
                             for l in range(0, len(str(s)), 2):
                                 c = t[l:l+2]
-                                txt.append(fontChar(font, c))
+                                ch = fontChar(font, c)
+                                if ch is None:
+                                    debugStats["droppedNoneGlyphs"] += 1
+                                else:
+                                    ch = normalizeExtractedText(ch)
+                                    if ch == "":
+                                        debugStats["emptyMappedGlyphs"] += 1
+                                    frame["txt"].append(ch)
                     else:
-                        txt.append(str(s))
+                        frame["txt"].append(normalizeExtractedText(str(s)))
             elif i.operator == Operator("TJ"):
+                frame = activeMarkedContentFrame()
+                if frame is None:
+                    debugStats["textOpsWithoutMcid"] += 1
+                    continue
                 for a in i.operands:
                     for s in a:
                         if isinstance(s, (int, Decimal)):
-                            pass # txt.append(" ") # not performing micro-spacing
+                            pass # not performing micro-spacing
                         else:
                             if font:
                                 t = s.__bytes__()
                                 if "encoding" in font:
                                     for b in t:
-                                        txt.append(fontChar(font, b))
+                                        ch = fontChar(font, b)
+                                        if ch is None:
+                                            debugStats["droppedNoneGlyphs"] += 1
+                                        else:
+                                            ch = normalizeExtractedText(ch)
+                                            if ch == "":
+                                                debugStats["emptyMappedGlyphs"] += 1
+                                            frame["txt"].append(ch)
                                 else:
                                     for l in range(0, len(str(s)), 2):
                                         c = t[l:l+2]
-                                        txt.append(fontChar(font, c))
+                                        ch = fontChar(font, c)
+                                        if ch is None:
+                                            debugStats["droppedNoneGlyphs"] += 1
+                                        else:
+                                            ch = normalizeExtractedText(ch)
+                                            if ch == "":
+                                                debugStats["emptyMappedGlyphs"] += 1
+                                            frame["txt"].append(ch)
 
     # load text blocks from structTree fields with IDs
     textBlocks = {}
@@ -433,8 +524,6 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
                     loadTextBlocks(v, pdfId, k, indent + "  ", page, depth+1, trail+[k], visited)
             visited.remove(objKey)
         elif key == "/K":
-            if page == 78:
-                print("trace")
             if pdfId:
                 if page is not None:
                     markedContent = markedContents.get((page, obj))
@@ -495,6 +584,9 @@ def loadFromPDF(cntlr, error, warning, modelXbrl, filepath, mappedUri, showInfo=
         print(f"Marked contents:")
         for k,v in markedContents.items():
             print(f"p{k[0]}R_mc{k[1]}: {v}")
+        print("Text extraction debug stats:")
+        for k, v in debugStats.items():
+            print(f"  {k}: {v}")
         print(f"str mcid:")
         for k,v in structMcid.items():
             print(f"{k}: {', '.join(v)}")
