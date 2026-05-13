@@ -166,21 +166,22 @@ def convert_fact_to_model10(fact_id, fact_obj, mcids):
     mcid_matches = find_mcids_for_value(value, decimals, mcids)
     
     if mcid_matches:
-        # Add valueSources in property-value form.
+        # Add valueSources in property-value form, nested in factValues.
         value_sources = build_value_sources(mcid_matches)
 
         if value_sources:
-            model10_fact['valueSources'] = value_sources
-            # Still add the computed value as well for reference
             model10_fact['factValues'] = [
-                {'name': f'converted:{fact_id}_val', 'value': str(value)}
+                {
+                    'name': f'converted:{fact_id}_val',
+                    'valueSources': value_sources
+                }
             ]
         else:
             model10_fact['factValues'] = [
                 {'name': f'converted:{fact_id}_val', 'value': str(value)}
             ]
     else:
-        # No MCID match; use direct value
+        # No MCID match; use direct value.
         model10_fact['factValues'] = [
             {'name': f'converted:{fact_id}_val', 'value': str(value)}
         ]
